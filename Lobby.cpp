@@ -39,6 +39,7 @@ void Lobby::show() {
                     continue;
                 }
                 std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // Consume newline
+                std::cin.clear();
                 Room room;
                 room.startServer(port); // Start the room as a server
                 break;
@@ -57,6 +58,7 @@ void Lobby::show() {
                     continue;
                 }
                 std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // Consume newline
+                std::cin.clear();
                 Room::joinRoom(ipAddress, port); // Join a room as a client
                 break;
             }

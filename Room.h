@@ -4,35 +4,48 @@
 #include <string>
 #include <vector>
 #include <netinet/in.h>
+#include <map> // Required for std::map
 
 // Room.h
 // This class manages the core chat room functionality.
 // It can act as a server (for the room creator) or a client (for those joining).
+
+struct ClientInfo {
+    std::string nickname;
+    std::string ip_address;
+    std::string port;
+    std::string prefix;
+    int permission_level; // ranges from 0-5 by default where 5 is host level permissions and 0 is guest permissions (no nicknames even).
+};
+
 class Room {
 public:
-    // Starts the chat room as a server on the specified port.
+
     void startServer(int port);
 
-    // Joins an existing chat room at the given IP address and port.
     static void joinRoom(const std::string& ipAddress, int port);
 
 private:
     // --- Server-specific methods ---
-    // Handles incoming client connections and messages.
+
+    void hostInputLoop(int server_fd);
+
     void serverLoop(int server_fd);
-    // Broadcasts a message to all connected clients except the sender.
+
     void broadcastMessage(const char* message, int sender_fd) const;
 
+    void handleCommand(int client_fd, const std::string& command);
+
     // --- Client-specific methods ---
-    // Handles sending and receiving messages for a client.
+
     static void clientLoop(int client_fd);
 
     // --- Utility methods ---
-    // Sets up a socket address structure.
-    static void setupAddress(struct sockaddr_in& address, int port, const std::string& ip = "");
 
-    // A list of file descriptors for connected clients (server-only).
-    std::vector<int> client_sockets;
+    static void setupAddress(sockaddr_in& address, int port, const std::string& ip = "");
+
+    // A map to store information about connected clients, keyed by socket descriptor.
+    std::map<int, ClientInfo> clients;
 };
 
 #endif // ROOM_H

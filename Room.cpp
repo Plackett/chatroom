@@ -9,9 +9,14 @@
 #include <thread>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <ranges>
 
 // Room.cpp
 // Implementation of the Room class, handling both server and client logic.
+
+// Atomic boolean to safely control the server's main loop from another thread.
+std::atomic<bool> server_running{true};
 
 // --- Public Methods ---
 
@@ -46,11 +51,21 @@ void Room::startServer(const int port) {
         exit(EXIT_FAILURE);
     }
 
-    std::cout << "Server started on port " << port << ". Waiting for connections..." << std::endl;
+    std::cout << "🚀 Server started on port " << port << ". Waiting for connections..." << std::endl;
+    std::cout << "💡 As the host, type '/help' for a list of commands." << std::endl;
+
+    char host_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &address.sin_addr, host_ip, INET_ADDRSTRLEN);
+    clients[0] = ClientInfo{"HOST", host_ip, std::to_string(port), "👑", 5};
+
+    // Start a detached thread to handle input from the host.
+    std::thread host_input_thread(&Room::hostInputLoop, this, server_fd);
+    host_input_thread.detach();
+
     serverLoop(server_fd);
 }
 
-void Room::joinRoom(const std::string& ipAddress, int port) {
+void Room::joinRoom(const std::string& ipAddress, const int port) {
     int sock = 0;
     sockaddr_in serv_addr{};
 
@@ -68,13 +83,36 @@ void Room::joinRoom(const std::string& ipAddress, int port) {
         return;
     }
 
-    std::cout << "Successfully connected to the room!" << std::endl;
-    std::cout << "You can start sending messages. Type '/quit' to exit." << std::endl;
+    // The initial welcome message is now sent by the server upon connection.
     clientLoop(sock);
 }
 
 
 // --- Private Server Methods ---
+
+void Room::hostInputLoop(const int server_fd) {
+    std::string message;
+    while (server_running) {
+        std::getline(std::cin, message);
+
+        if (!server_running) break;
+
+        if (message == "/close") {
+            std::cout << "🔒 Closing the room..." << std::endl;
+            broadcastMessage("🔒 Host has closed the room. Goodbye!", -1);
+            server_running = false;
+            shutdown(server_fd, SHUT_RD);
+            close(server_fd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            exit(0);
+        } else if (message.at(0) == '/') {
+            handleCommand(0,message);
+        } else if (!message.empty()) {
+            std::string host_message = clients[0].prefix + " [" + clients[0].nickname + "]: " + message;
+            broadcastMessage(host_message.c_str(), -1);
+        }
+    }
+}
 
 void Room::serverLoop(const int server_fd) {
     fd_set master_set, working_set;
@@ -83,52 +121,67 @@ void Room::serverLoop(const int server_fd) {
     FD_ZERO(&master_set);
     FD_SET(server_fd, &master_set);
 
-    while (true) {
+    while (server_running) {
         working_set = master_set;
-        // Wait for an activity on one of the sockets
-        if (select(max_sd + 1, &working_set, nullptr, nullptr, nullptr) < 0) {
-            perror("select error");
-            exit(EXIT_FAILURE);
+        struct timeval timeout = {1, 0};
+
+        if (select(max_sd + 1, &working_set, nullptr, nullptr, &timeout) < 0) {
+            if(server_running) perror("select error");
+            break;
         }
 
         for (int i = 0; i <= max_sd; i++) {
             if (FD_ISSET(i, &working_set)) {
-                // If it's the listening socket, accept a new connection
-                if (i == server_fd) {
-                    int new_socket;
+                if (i == server_fd) { // New connection
                     sockaddr_in client_address{};
                     socklen_t address_length = sizeof(client_address);
-                    if ((new_socket = accept(server_fd, reinterpret_cast<sockaddr*>(&client_address), &address_length)) < 0) {
-                        perror("accept");
-                        exit(EXIT_FAILURE);
+                    int new_socket = accept(server_fd, reinterpret_cast<sockaddr*>(&client_address), &address_length);
+
+                    if (new_socket < 0) {
+                        if (server_running) perror("accept");
+                        continue;
                     }
 
-                    std::cout << "New connection, socket fd is " << new_socket
-                              << ", ip is : " << inet_ntoa(client_address.sin_addr)
-                              << ", port : " << ntohs(client_address.sin_port) << std::endl;
+                    std::string client_ip = inet_ntoa(client_address.sin_addr);
+                    std::string default_nick = "user" + std::to_string(new_socket);
+
+                    std::cout << "✅ New connection from " << client_ip << " on socket " << new_socket << std::endl;
 
                     FD_SET(new_socket, &master_set);
-                    if (new_socket > max_sd) {
-                        max_sd = new_socket;
-                    }
-                    client_sockets.push_back(new_socket);
-                } else { // It's a client socket, handle incoming message
-                    char buffer[1024] = {0};
+                    if (new_socket > max_sd) max_sd = new_socket;
 
+                    clients[new_socket] = {default_nick, client_ip, std::to_string(ntohs(client_address.sin_port)), "🗣️", 0};
+
+                    std::string welcome = "🎉 Welcome! Your default name is " + default_nick + ". Type '/help' for commands.";
+                    send(new_socket, welcome.c_str(), welcome.length(), 0);
+
+                    std::string notification = "📢 " + default_nick + " has joined the room!";
+                    broadcastMessage(notification.c_str(), new_socket);
+
+                } else { // Message from existing client
+                    char buffer[1024] = {0};
                     if (const int value_read = static_cast<int>(read(i, buffer, 1024)); value_read <= 0) {
                         // Client disconnected
-                        sockaddr_in client_addr{};
-                        socklen_t addr_len = sizeof(client_addr);
-                        getpeername(i, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
-                        std::cout << "Host disconnected, ip " << inet_ntoa(client_addr.sin_addr)
-                                  << ", port " << ntohs(client_addr.sin_port) << std::endl;
+                        std::cout << "❌ " << clients[i].nickname << " (" << clients[i].ip_address << ") has disconnected." << std::endl;
+                        std::string notification = "📢 " + clients[i].nickname + " has left the room.";
+                        broadcastMessage(notification.c_str(), i);
+
                         close(i);
                         FD_CLR(i, &master_set);
-                        // Remove from client list
-                        client_sockets.erase(std::remove(client_sockets.begin(), client_sockets.end(), i), client_sockets.end());
+                        clients.erase(i);
                     } else {
-                        // Broadcast the message to other clients
-                        broadcastMessage(buffer, i);
+                        // Message received
+                        std::string message(buffer, value_read);
+                        message.erase(message.find_last_not_of(" \n\r\t")+1); // Trim whitespace
+
+                        if (!message.empty() && message[0] == '/') {
+                            handleCommand(i, message);
+                        } else if (!message.empty()) {
+                            std::string prefix = clients[i].prefix + " [" + clients[i].nickname + "]: ";
+                            std::string full_message = prefix + message;
+                            broadcastMessage(full_message.c_str(), i);
+                            std::cout << full_message << std::endl; // Show on host console
+                        }
                     }
                 }
             }
@@ -136,26 +189,61 @@ void Room::serverLoop(const int server_fd) {
     }
 }
 
-
-void Room::broadcastMessage(const char* message, const int sender_fd) const {
-    for (const int client_fd : client_sockets) {
-        if (client_fd != sender_fd) {
-            send(client_fd, message, strlen(message), 0);
+void Room::handleCommand(const int client_fd, const std::string& command) {
+    if (clients[client_fd].permission_level >= 1 && command.rfind("/nick ", 0) == 0) {
+        const std::string new_nickname = command.substr(6);
+        if (new_nickname.empty() || new_nickname.length() > 20 || new_nickname.find(' ') != std::string::npos) {
+            const auto msg = "❌ Invalid nickname. Must be 1-20 chars, no spaces.";
+            send(client_fd, msg, strlen(msg), 0);
+            return;
         }
+        const std::string old_nickname = clients[client_fd].nickname;
+        clients[client_fd].nickname = new_nickname;
+        const std::string notification = "🔄 " + old_nickname + " is now known as " + new_nickname;
+        broadcastMessage(notification.c_str(), -1);
+        std::cout << notification << std::endl;
+
+    } else if (command == "/users") {
+        std::string user_list = "👥 Connected Users (" + std::to_string(clients.size()) + " total):\n";
+        for (const auto &[nickname, ip_address, port, prefix, permission_level]: clients | std::views::values) {
+            user_list += "  - " + prefix;
+            user_list += nickname;
+            user_list += " (" + ip_address + ":";
+            user_list += port + ")";
+            user_list += " [" + permission_level;
+            user_list += "]\n";
+        }
+        send(client_fd, user_list.c_str(), user_list.length(), 0);
+
+    } else if (command == "/help") {
+        const auto msg = "📋 Commands:\n  /nick <name> - Change your nickname\n  /users - List connected users\n  /quit - Leave the room\n  /help - Show this message";
+        send(client_fd, msg, strlen(msg), 0);
+
+    } else {
+        const auto msg = "❓ Unknown command. Type '/help' for a list.";
+        send(client_fd, msg, strlen(msg), 0);
     }
 }
 
+void Room::broadcastMessage(const char* message, const int sender_fd) const {
+    for (const auto &key: clients | std::views::keys) {
+        if (key != sender_fd) {
+            send(key, message, strlen(message), 0);
+        }
+    }
+}
 
 // --- Private Client Methods ---
 
 void receiveMessages(const int sock) {
     char buffer[1024] = {0};
     while (true) {
+        memset(buffer, 0, sizeof(buffer));
         if (const int value_read = static_cast<int>(read(sock, buffer, 1024)); value_read > 0) {
-            std::cout << "\n> " << buffer << std::endl;
-            memset(buffer, 0, sizeof(buffer)); // Clear buffer
+            std::cout << "\r" << buffer << std::endl;
+            std::cout << "You: " << std::flush;
         } else {
-             std::cout << "\nServer disconnected." << std::endl;
+             std::cout << "\n🔌 Server disconnected. Press Enter to exit." << std::endl;
              close(sock);
              exit(0);
         }
@@ -163,17 +251,24 @@ void receiveMessages(const int sock) {
 }
 
 void Room::clientLoop(int client_fd) {
-    // Start a separate thread to receive messages
     std::thread receiver_thread(receiveMessages, client_fd);
-    receiver_thread.detach(); // Let the thread run independently
+    receiver_thread.detach();
 
     std::string message;
     while (true) {
-        std::getline(std::cin, message);
-        if (message == "/quit") {
+        std::cout << "You: " << std::flush;
+        if (!std::getline(std::cin, message)) {
             break;
         }
-        send(client_fd, message.c_str(), message.length(), 0);
+
+        if (message == "/quit") {
+            std::cout << "👋 Leaving the room. Goodbye!" << std::endl;
+            break;
+        }
+
+        if (!message.empty()) {
+            send(client_fd, message.c_str(), message.length(), 0);
+        }
     }
     close(client_fd);
 }
@@ -185,13 +280,11 @@ void Room::setupAddress(sockaddr_in& address, const int port, const std::string&
     address.sin_port = htons(port);
 
     if (!ip.empty()) {
-        // Client-side: convert IP from text to binary
         if (inet_pton(AF_INET, ip.c_str(), &address.sin_addr) <= 0) {
             std::cerr << "\nInvalid address/ Address not supported \n";
             exit(EXIT_FAILURE);
         }
     } else {
-        // Server-side: accept connections on any IP
         address.sin_addr.s_addr = INADDR_ANY;
     }
 }
